@@ -534,3 +534,6 @@ class DefaultCycleManager(models.Model):
     def _compute_interval(self):
         for rec in self:
             rec.interval = rec.cycle_duration
+
+    def on_start_date_change(self, cycle):
+        pass
