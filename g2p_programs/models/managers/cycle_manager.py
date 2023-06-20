@@ -1,6 +1,6 @@
 # Part of OpenG2P. See LICENSE file for full copyright and licensing details.
 import logging
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from odoo import _, api, fields, models
 from odoo.exceptions import ValidationError
@@ -97,24 +97,121 @@ class BaseCycleManager(models.AbstractModel):
         """
         Hook for when the start date change
         """
+        raise NotImplementedError()
+
+    def approve_cycle(self, cycle, auto_approve=False, entitlement_manager=None):
+        """
+
+        :param cycle:
+        :param auto_approve:
+        :param entitlement_manager:
+        :return:
+        """
+        # Check if user is allowed to approve the cycle
+        if cycle.state == "to_approve":
+            cycle.update({"state": "approved"})
+            # Running on_state_change because it is not triggered automatically with rec.update above
+            self.on_state_change(cycle)
+        else:
+            message = _("Only 'to approve' cycles can be approved.")
+            kind = "danger"
+
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "title": _("Cycle"),
+                    "message": message,
+                    "sticky": True,
+                    "type": kind,
+                    "next": {
+                        "type": "ir.actions.act_window_close",
+                    },
+                },
+            }
+        # Approve entitlements
+        if auto_approve:
+            if entitlement_manager.IS_CASH_ENTITLEMENT:
+                entitlement_mdl = "g2p.entitlement"
+            else:
+                entitlement_mdl = "g2p.entitlement.inkind"
+            entitlements = cycle.get_entitlements(
+                ["draft", "pending_validation"], entitlement_model=entitlement_mdl
+            )
+            if entitlements:
+                return entitlement_manager.validate_entitlements(cycle)
+            else:
+                message = _(
+                    "Auto-approve entitlements is set but there are no entitlements to process."
+                )
+                kind = "warning"
+
+            return {
+                "type": "ir.actions.client",
+                "tag": "display_notification",
+                "params": {
+                    "title": _("Entitlements"),
+                    "message": message,
+                    "sticky": True,
+                    "type": kind,
+                    "next": {
+                        "type": "ir.actions.act_window_close",
+                    },
+                },
+            }
 
     def on_state_change(self, cycle):
         """
-        Hook for when the state change
-        Args:
-            cycle:
 
-        Returns:
-
+        :param cycle:
+        :return:
         """
+        if cycle.state == cycle.STATE_APPROVED:
+            if not self.approver_group_id:
+                raise ValidationError(_("The cycle approver group is not specified!"))
+            else:
+                if (
+                    self.env.user.id != 1
+                    and self.env.user.id not in self.approver_group_id.users.ids
+                ):
+                    raise ValidationError(
+                        _("You are not allowed to approve this cycle!")
+                    )
+
+    def _ensure_can_edit_cycle(self, cycle):
+        """Base :meth:'_ensure_can_edit_cycle`
+        Check if the cycle can be editted
+
+        :param cycle: A recordset of cycle
+        :return:
+        """
+        if cycle.state not in [cycle.STATE_DRAFT]:
+            raise ValidationError(_("The Cycle is not in draft mode"))
+
+    def mark_import_as_done(self, cycle, msg):
+        """Base :meth:`mark_import_as_done`
+        Post a message in the chatter
+
+        :param cycle: A recordset of cycle
+        :param msg: A string to be posted in the chatter
+        :return:
+        """
+        self.ensure_one()
+        cycle.locked = False
+        cycle.locked_reason = None
+        cycle.message_post(body=msg)
 
 
 class DefaultCycleManager(models.Model):
     _name = "g2p.cycle.manager.default"
-    _inherit = ["g2p.base.cycle.manager", "g2p.manager.source.mixin"]
+    _inherit = [
+        "g2p.base.cycle.manager",
+        "g2p.cycle.recurrence.mixin",
+        "g2p.manager.source.mixin",
+    ]
     _description = "Default Cycle Manager"
 
-    cycle_duration = fields.Integer(default=30, required=True)
+    cycle_duration = fields.Integer(default=1, required=True, string="Recurrence")
     approver_group_id = fields.Many2one(
         comodel_name="res.groups",
         string="Approver Group",
@@ -123,6 +220,8 @@ class DefaultCycleManager(models.Model):
 
     def check_eligibility(self, cycle, beneficiaries=None):
         """
+        Default Cycle Manager eligibility checker
+
         :param cycle: The cycle that is being verified
         :type cycle: :class:`g2p_programs.models.cycle.G2PCycle`
         :param beneficiaries: the beneficiaries that need to be verified. By Default the one with the state ``draft``
@@ -233,58 +332,43 @@ class DefaultCycleManager(models.Model):
     def mark_cancelled(self, cycle):
         cycle.update({"state": constants.STATE_CANCELLED})
 
-    def validate_entitlements(self, cycle, entitlement_ids):
-        # TODO: call the program's entitlement manager and validate the entitlements
-        # TODO: Use a Job attached to the cycle
-        # TODO: Implement validation workflow
-        for rec in self:
-            rec._ensure_can_edit_cycle(cycle)
-            rec.program_id.get_manager(constants.MANAGER_ENTITLEMENT)
-            if len(entitlement_ids) < 200:
-                self._validate_entitlements(entitlement_ids)
-            else:
-                self._validate_entitlements_async(cycle, entitlement_ids)
-
-    def _validate_entitlements_async(self, cycle, entitlement_ids):
-        _logger.debug("Validate entitlement asynchronously")
-        cycle.message_post(
-            body=_("Validation for %s entitlements started.", len(entitlement_ids))
-        )
-        cycle.write(
-            {
-                "locked": True,
-                "locked_reason": _("Validate entitlement for beneficiaries."),
-            }
-        )
-
-        jobs = []
-        max_jobs_per_batch = 100
-        entitlements = []
-        max_rec = len(entitlement_ids)
-        for ctr_entitlements, entitlement in enumerate(entitlement_ids, 1):
-            entitlements.append(entitlement.id)
-            if (
-                ctr_entitlements % max_jobs_per_batch == 0
-            ) or ctr_entitlements == max_rec:
-                entitlements_ids = self.env["g2p.entitlement"].search(
-                    [("id", "in", entitlements)]
-                )
-                jobs.append(self.delayable()._validate_entitlements(entitlements_ids))
-                entitlements = []
-
-        main_job = group(*jobs)
-        main_job.on_done(
-            self.delayable().mark_import_as_done(cycle, _("Entitlement approved."))
-        )
-        main_job.delay()
-
-    def _validate_entitlements(self, entitlements):
-        entitlement_manager = self.program_id.get_manager(constants.MANAGER_ENTITLEMENT)
-        entitlement_manager.approve_entitlements(entitlements)
-
     def new_cycle(self, name, new_start_date, sequence):
         _logger.info("Creating new cycle for program %s", self.program_id.name)
         _logger.info("New start date: %s", new_start_date)
+
+        # convert date to datetime
+        new_start_date = datetime.combine(new_start_date, datetime.min.time())
+
+        # get start date and end date
+        # Note:
+        # second argument is irrelevant but make sure it is in timedelta class
+        # and do not exceed to 24 hours
+        occurences = self._get_ranges(new_start_date, timedelta(seconds=1))
+
+        prev_occurence = next(occurences)
+        current_occurence = next(occurences)
+
+        start_date = None
+        end_date = None
+
+        # This prevents getting an end date that is less than the start date
+        while True:
+
+            # get the date of occurences
+            start_date = prev_occurence[0]
+            end_date = current_occurence[0] - timedelta(days=1)
+
+            # To handle DST (Daylight Saving Time) changes
+            start_date = start_date + timedelta(hours=11)
+            end_date = end_date + timedelta(hours=11)
+
+            if start_date >= new_start_date:
+                break
+
+            # move current occurence to previous then get a new current occurence
+            prev_occurence = current_occurence
+            current_occurence = next(occurences)
+
         for rec in self:
             cycle = self.env["g2p.cycle"].create(
                 {
@@ -292,8 +376,8 @@ class DefaultCycleManager(models.Model):
                     "name": name,
                     "state": "draft",
                     "sequence": sequence,
-                    "start_date": new_start_date,
-                    "end_date": new_start_date + timedelta(days=rec.cycle_duration),
+                    "start_date": start_date,
+                    "end_date": end_date,
                 }
             )
             _logger.info("New cycle created: %s", cycle.name)
@@ -385,25 +469,7 @@ class DefaultCycleManager(models.Model):
             )
         cycle.update({"cycle_membership_ids": new_beneficiaries})
 
-    def mark_import_as_done(self, cycle, msg):
-        self.ensure_one()
-        cycle.locked = False
-        cycle.locked_reason = None
-        cycle.message_post(body=msg)
-
-    def _ensure_can_edit_cycle(self, cycle):
-        if cycle.state not in [cycle.STATE_DRAFT]:
-            raise ValidationError(_("The Cycle is not in draft mode"))
-
-    def on_state_change(self, cycle):
-        if cycle.state == cycle.STATE_APPROVED:
-            if not self.approver_group_id:
-                raise ValidationError(_("The cycle approver group is not specified!"))
-            else:
-                if (
-                    self.env.user.id != 1
-                    and self.env.user.id not in self.approver_group_id.users.ids
-                ):
-                    raise ValidationError(
-                        _("You are not allowed to approve this cycle!")
-                    )
+    @api.depends("cycle_duration")
+    def _compute_interval(self):
+        for rec in self:
+            rec.interval = rec.cycle_duration
